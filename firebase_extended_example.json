@@ -1,0 +1,28 @@
+{
+  "display": {
+    "sentences": [
+      "🌟 Welcome to Smart P10 Display! 🌟",
+      "📡 Firebase Real-time Database Connected",
+      "🔄 Auto-updating every 10 seconds",
+      "⚙️ Configure via WiFi Portal easily",
+      "📱 Control from Firebase Console",
+      "🔗 Auto-reconnect on connection loss",
+      "💡 Change selectedSentence to switch text",
+      "🎯 Up to 10 messages supported",
+      "🚀 ESP8266 + P10 LED Matrix Project",
+      "✨ Edit this JSON in Firebase Console"
+    ],
+    "selectedSentence": 0,
+    "settings": {
+      "scrollSpeed": 50,
+      "brightness": 100,
+      "updateInterval": 10000
+    },
+    "status": {
+      "lastUpdate": "2025-07-28T12:00:00Z",
+      "deviceOnline": true,
+      "wifiConnected": true,
+      "firebaseConnected": true
+    }
+  }
+}

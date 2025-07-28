@@ -1,0 +1,17 @@
+{
+  "display": {
+    "sentences": [
+      "Welcome to P10 Display!",
+      "Firebase connected successfully",
+      "Real-time text updates working",
+      "Change text from Firebase console",
+      "Multiple messages supported",
+      "P10 LED Matrix with ESP8266",
+      "WiFiManager configuration portal",
+      "Auto-reconnect on WiFi loss",
+      "Scrolling text display system",
+      "Visit Firebase console to edit"
+    ],
+    "selectedSentence": 0
+  }
+}
