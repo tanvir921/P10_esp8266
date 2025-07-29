@@ -15,6 +15,7 @@
 #include <WiFiManager.h>
 #include <Firebase_ESP_Client.h>
 #include <ESP8266WebServer.h>
+#include <EEPROM.h>
 
 // Provide the token generation process info.
 #include <addons/TokenHelper.h>
@@ -39,6 +40,10 @@ void ScrollingText(int y, uint8_t speed);
 void initWiFiManager();
 void initFirebase();
 void updateTextFromFirebase();
+void startFirebaseStream();
+void handleFirebaseStream();
+void saveDataToEEPROM();
+void loadDataFromEEPROM();
 void displayMessage(String message, bool clearFirst = true);
 void checkWiFiConnection();
 void saveConfigCallback();
@@ -51,13 +56,25 @@ int selectedSentence = 0; // Which sentence to display
 int totalSentences = 0; // How many sentences are available
 unsigned long lastFirebaseUpdate = 0;
 unsigned long lastWiFiCheck = 0;
-const unsigned long firebaseUpdateInterval = 10000; // Update every 10 seconds
+const unsigned long firebaseUpdateInterval = 10000; // Check every 10 seconds (more responsive)
 const unsigned long wifiCheckInterval = 5000; // Check WiFi every 5 seconds (faster reconnect)
 const unsigned long wifiReconnectTimeout = 3600000; // 1 hour = 60 minutes * 60 seconds * 1000 milliseconds
 bool firebaseConnected = false;
 bool shouldSaveConfig = false;
 bool wifiReconnecting = false;
 unsigned long wifiDisconnectedTime = 0;
+
+// Firebase streaming variables
+bool streamActive = false;
+bool dataChanged = false;
+unsigned long lastDataSave = 0;
+const unsigned long dataSaveInterval = 5000; // Save to EEPROM every 5 seconds if changed
+
+// EEPROM addresses
+const int EEPROM_SIZE = 1024;
+const int EEPROM_ADDR_SELECTED = 0;
+const int EEPROM_ADDR_TOTAL = 4;
+const int EEPROM_ADDR_SENTENCES = 8;
 
 //SETUP DMD
 #define DISPLAYS_WIDE 1 // Panel Columns
@@ -74,6 +91,12 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
   Serial.println("Starting P10 Display with WiFiManager and Firebase...");
+
+  // Initialize EEPROM
+  EEPROM.begin(EEPROM_SIZE);
+  
+  // Load cached data from EEPROM first
+  loadDataFromEEPROM();
 
   // DMDESP Setup
   Disp.start(); // Start DMDESP library
@@ -99,8 +122,9 @@ void setup() {
 // LOOP
 
 void loop() {
-  // Run display refresh
+  // Always run display refresh first - this ensures continuous display
   Disp.loop(); 
+  ScrollingText(0, 50); // Always keep the display scrolling
 
   // Check WiFi connection periodically
   if (millis() - lastWiFiCheck > wifiCheckInterval) {
@@ -108,14 +132,27 @@ void loop() {
     lastWiFiCheck = millis();
   }
 
-  // Update text from Firebase periodically (only if Firebase is connected)
-  if (firebaseConnected && millis() - lastFirebaseUpdate > firebaseUpdateInterval) {
-    updateTextFromFirebase();
-    lastFirebaseUpdate = millis();
+  // Handle Firebase stream (lightweight, non-blocking)
+  if (firebaseConnected) {
+    if (!streamActive && millis() - lastFirebaseUpdate > firebaseUpdateInterval) {
+      // Start Firebase stream
+      startFirebaseStream();
+      lastFirebaseUpdate = millis();
+    } else if (streamActive) {
+      // Handle stream events
+      handleFirebaseStream();
+    }
   }
-
-  // Display scrolling text
-  ScrollingText(0, 50); 
+  
+  // Save data to EEPROM if changed (background task)
+  if (dataChanged && millis() - lastDataSave > dataSaveInterval) {
+    saveDataToEEPROM();
+    dataChanged = false;
+    lastDataSave = millis();
+  }
+  
+  // Small delay to prevent overwhelming the system
+  delay(1);
 }
 
 
@@ -126,10 +163,20 @@ void ScrollingText(int y, uint8_t speed) {
 
   static uint32_t pM;
   static uint32_t x;
+  static String lastDisplayText = "";
+  static bool needsRedraw = true;
+  
   uint32_t width = Disp.width();
   uint32_t height = Disp.height();
   Disp.setFont(ElektronMart6x8);
   uint32_t fullScroll = Disp.textWidth(displayText.c_str()) + width;
+  
+  // Check if text has changed
+  if (displayText != lastDisplayText) {
+    lastDisplayText = displayText;
+    needsRedraw = true;
+    x = 0; // Reset scroll position when text changes
+  }
   
   if((millis() - pM) > speed) { 
     pM = millis();
@@ -138,14 +185,16 @@ void ScrollingText(int y, uint8_t speed) {
     } else {
       x = 0;
     }
-    
-    // Clear the display before drawing new text
+    needsRedraw = true;
+  }
+  
+  // Only clear and redraw when necessary
+  if (needsRedraw) {
     Disp.clear();
-    
     // Center the text vertically in the full display
     Disp.drawText(width - x, (height / 2) - 4, displayText.c_str());
-  }  
-
+    needsRedraw = false;
+  }
 }
 
 //--------------------------
@@ -354,7 +403,111 @@ void initFirebase() {
 }
 
 //--------------------------
-// UPDATE TEXT FROM FIREBASE
+// EEPROM DATA MANAGEMENT
+
+void saveDataToEEPROM() {
+  Serial.println("Saving data to EEPROM...");
+  
+  // Save selected sentence
+  EEPROM.put(EEPROM_ADDR_SELECTED, selectedSentence);
+  
+  // Save total sentences
+  EEPROM.put(EEPROM_ADDR_TOTAL, totalSentences);
+  
+  // Save sentences (each sentence max 80 chars)
+  int addr = EEPROM_ADDR_SENTENCES;
+  for (int i = 0; i < totalSentences && i < 10; i++) {
+    String sentence = sentences[i];
+    if (sentence.length() > 80) sentence = sentence.substring(0, 80);
+    
+    // Save length first
+    uint8_t len = sentence.length();
+    EEPROM.put(addr, len);
+    addr += sizeof(uint8_t);
+    
+    // Save string data
+    for (int j = 0; j < len; j++) {
+      EEPROM.put(addr + j, sentence[j]);
+    }
+    addr += 80; // Fixed space per sentence
+  }
+  
+  EEPROM.commit();
+  Serial.println("Data saved to EEPROM");
+}
+
+void loadDataFromEEPROM() {
+  Serial.println("Loading data from EEPROM...");
+  
+  // Load selected sentence
+  EEPROM.get(EEPROM_ADDR_SELECTED, selectedSentence);
+  
+  // Load total sentences
+  EEPROM.get(EEPROM_ADDR_TOTAL, totalSentences);
+  
+  // Validate data
+  if (selectedSentence < 0 || selectedSentence > 9) selectedSentence = 0;
+  if (totalSentences < 0 || totalSentences > 10) totalSentences = 0;
+  
+  // Load sentences
+  int addr = EEPROM_ADDR_SENTENCES;
+  for (int i = 0; i < totalSentences && i < 10; i++) {
+    // Load length
+    uint8_t len;
+    EEPROM.get(addr, len);
+    addr += sizeof(uint8_t);
+    
+    if (len > 80) len = 80; // Safety check
+    
+    // Load string data
+    char buffer[81];
+    for (int j = 0; j < len; j++) {
+      EEPROM.get(addr + j, buffer[j]);
+    }
+    buffer[len] = '\0';
+    sentences[i] = String(buffer);
+    
+    addr += 80; // Fixed space per sentence
+  }
+  
+  // Set initial display text from cached data
+  if (totalSentences > 0 && selectedSentence < totalSentences) {
+    displayText = sentences[selectedSentence];
+    Serial.println("Loaded cached display text: " + displayText);
+  } else if (totalSentences > 0) {
+    displayText = sentences[0];
+    selectedSentence = 0;
+    Serial.println("Using first cached sentence: " + displayText);
+  } else {
+    displayText = "Loading from Firebase...";
+    Serial.println("No cached data found, will load from Firebase");
+  }
+  
+  Serial.println("Loaded " + String(totalSentences) + " sentences from EEPROM");
+}
+
+//--------------------------
+// FIREBASE STREAM FUNCTIONS
+
+void startFirebaseStream() {
+  if (!Firebase.ready()) {
+    Serial.println("Firebase not ready for streaming!");
+    return;
+  }
+  
+  Serial.println("Starting Firebase stream...");
+  
+  // Use a simple get request instead of complex streaming to reduce load
+  updateTextFromFirebase();
+}
+
+void handleFirebaseStream() {
+  // This function is kept for compatibility but not used in the simplified approach
+  streamActive = false;
+}
+
+//--------------------------
+// SIMPLIFIED FIREBASE UPDATE
 
 void updateTextFromFirebase() {
   if (!Firebase.ready()) {
@@ -362,58 +515,118 @@ void updateTextFromFirebase() {
     return;
   }
   
-  Serial.println("Attempting to fetch data from Firebase...");
+  Serial.println("Quick Firebase update...");
   
-  // Get the selected sentence index
+  bool updated = false;
+  
+  // Always check for sentences first, especially on initial load
+  static int updateCounter = 0;
+  updateCounter++;
+  
+  // On first run or every 5th update, check for new sentences
+  if (totalSentences == 0 || updateCounter >= 5) {
+    updateCounter = 0;
+    
+    Serial.println("Checking for sentences in Firebase...");
+    
+    // Check all sentences to build the initial list
+    int maxSentencesToCheck = (totalSentences == 0) ? 10 : 3; // Check all on first run, fewer on updates
+    
+    for (int i = 0; i < maxSentencesToCheck; i++) {
+      String path = "/display/sentences/" + String(i);
+      if (Firebase.RTDB.getString(&fbdo, path.c_str())) {
+        String sentence = fbdo.stringData();
+        if (sentence.length() > 0) {
+          if (sentence != sentences[i]) {
+            sentences[i] = sentence;
+            updated = true;
+            Serial.println("Updated sentence " + String(i) + ": " + sentence);
+          }
+          // Update total sentences count
+          if (i >= totalSentences) {
+            totalSentences = i + 1;
+            updated = true;
+          }
+        } else if (i == 0) {
+          // If first sentence is empty, there are no sentences
+          Serial.println("No sentences found in Firebase");
+          break;
+        } else {
+          // End of sentences found
+          break;
+        }
+      } else {
+        Serial.println("Failed to read sentence " + String(i) + ": " + fbdo.errorReason());
+        if (i == 0) {
+          // Can't read first sentence, might be a connection issue
+          Serial.println("Cannot read Firebase data");
+          return;
+        }
+        break;
+      }
+      delay(10); // Small delay between requests
+    }
+  }
+  
+  // Now check for selected sentence (after we have sentences loaded)
   if (Firebase.RTDB.getInt(&fbdo, "/display/selectedSentence")) {
     int newSelected = fbdo.intData();
-    Serial.println("Successfully read selectedSentence: " + String(newSelected));
+    Serial.println("Firebase selectedSentence: " + String(newSelected) + ", current: " + String(selectedSentence));
+    
     if (newSelected != selectedSentence && newSelected >= 0) {
-      selectedSentence = newSelected;
-      Serial.println("Selected sentence updated to: " + String(selectedSentence));
+      // If we don't have enough sentences loaded yet, but the selection changed, try to load that specific sentence
+      if (newSelected >= totalSentences) {
+        Serial.println("Loading additional sentence " + String(newSelected) + "...");
+        String path = "/display/sentences/" + String(newSelected);
+        if (Firebase.RTDB.getString(&fbdo, path.c_str())) {
+          String sentence = fbdo.stringData();
+          if (sentence.length() > 0) {
+            sentences[newSelected] = sentence;
+            totalSentences = max(totalSentences, newSelected + 1);
+            updated = true;
+            Serial.println("Loaded new sentence " + String(newSelected) + ": " + sentence);
+          }
+        }
+      }
+      
+      // Now update the selected sentence if we have it
+      if (newSelected < totalSentences && sentences[newSelected].length() > 0) {
+        selectedSentence = newSelected;
+        displayText = sentences[selectedSentence];
+        updated = true;
+        Serial.println("Updated selected sentence to: " + String(selectedSentence) + " - " + displayText);
+      } else {
+        Serial.println("Selected sentence " + String(newSelected) + " not available yet");
+      }
     }
   } else {
     Serial.println("Failed to read selectedSentence: " + fbdo.errorReason());
   }
   
-  // Get sentences individually instead of as JSON array
-  Serial.println("Attempting to read sentences individually...");
-  totalSentences = 0;
-  
-  // Read each sentence individually from Firebase
-  for (int i = 0; i < 10; i++) {
-    String path = "/display/sentences/" + String(i);
-    if (Firebase.RTDB.getString(&fbdo, path.c_str())) {
-      String sentence = fbdo.stringData();
-      if (sentence.length() > 0) {
-        sentences[i] = sentence;
-        totalSentences = i + 1;
-        Serial.println("Sentence " + String(i) + ": " + sentences[i]);
-      } else {
-        break;
-      }
-    } else {
-      Serial.println("No sentence found at path: " + path);
-      break;
+  // If display text is still loading message or default, set it to the selected sentence
+  if (totalSentences > 0 && (displayText == "Loading from Firebase..." || displayText == "Starting P10 Display...")) {
+    if (selectedSentence < totalSentences && sentences[selectedSentence].length() > 0) {
+      displayText = sentences[selectedSentence];
+      updated = true;
+      Serial.println("Set initial display text: " + displayText);
+    } else if (sentences[0].length() > 0) {
+      displayText = sentences[0];
+      selectedSentence = 0;
+      updated = true;
+      Serial.println("Using first sentence as default: " + displayText);
     }
   }
   
-  Serial.println("Total sentences found: " + String(totalSentences));
-  
-  // Set display text based on selected sentence
-  if (selectedSentence < totalSentences && totalSentences > 0) {
-    String newText = sentences[selectedSentence];
-    if (newText != displayText) {
-      displayText = newText;
-      Serial.println("Display text updated to: " + displayText);
+  // Only show error if we truly have no sentences
+  if (totalSentences == 0) {
+    Serial.println("No sentences available from Firebase");
+    if (displayText == "Loading from Firebase..." || displayText == "Starting P10 Display...") {
+      displayText = "No sentences in Firebase";
     }
-  } else if (totalSentences > 0) {
-    // If selected sentence is out of range, use first sentence
-    displayText = sentences[0];
-    selectedSentence = 0;
-    Serial.println("Selected sentence out of range, using first: " + displayText);
-  } else {
-    displayText = "No sentences configured";
-    Serial.println("No sentences found in database!");
+  }
+  
+  if (updated) {
+    dataChanged = true;
+    Serial.println("Firebase update completed. Total sentences: " + String(totalSentences));
   }
 }
