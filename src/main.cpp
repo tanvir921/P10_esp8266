@@ -10,12 +10,13 @@
 */
 
 #include <DMDESP.h>
-#include <fonts/ElektronMart6x8.h>
+#include <fonts/ElektronMart6x12.h>
 #include <ESP8266WiFi.h>
 #include <WiFiManager.h>
 #include <Firebase_ESP_Client.h>
 #include <ESP8266WebServer.h>
 #include <EEPROM.h>
+#include <time.h>
 
 // Provide the token generation process info.
 #include <addons/TokenHelper.h>
@@ -36,7 +37,9 @@ FirebaseConfig config;
 WiFiManager wm;
 
 // Function declarations
-void ScrollingText(int y, uint8_t speed);
+bool ScrollingText(int y, uint8_t speed);
+void displayDigitalClock();
+void initTimeSync();
 void initWiFiManager();
 void initFirebase();
 void updateTextFromFirebase();
@@ -70,6 +73,19 @@ bool dataChanged = false;
 unsigned long lastDataSave = 0;
 const unsigned long dataSaveInterval = 5000; // Save to EEPROM every 5 seconds if changed
 
+// Clock display variables
+bool showClock = false; // Start with scrolling text first
+unsigned long lastClockSwitch = 0;
+const unsigned long clockDisplayTime = 10000; // Show clock for 10 seconds
+bool colonBlink = true;
+unsigned long lastColonBlink = 0;
+const unsigned long colonBlinkInterval = 500; // Blink every 500ms
+bool scrollCompleted = false;
+
+// Time zone settings (adjust for your location)
+const long gmtOffset_sec = 6 * 3600; // GMT+6 for Bangladesh (6 hours * 3600 seconds)
+const int daylightOffset_sec = 0; // No daylight saving in Bangladesh
+
 // EEPROM addresses
 const int EEPROM_SIZE = 1024;
 const int EEPROM_ADDR_SELECTED = 0;
@@ -101,7 +117,7 @@ void setup() {
   // DMDESP Setup
   Disp.start(); // Start DMDESP library
   Disp.setBrightness(100); // Brightness level
-  Disp.setFont(ElektronMart6x8); // Set font
+  Disp.setFont(ElektronMart6x12); // Set font
   
   // Show startup message
   displayMessage("P10 Display Starting...");
@@ -109,6 +125,9 @@ void setup() {
   
   // Initialize WiFiManager
   initWiFiManager();
+  
+  // Initialize time after WiFi connection
+  initTimeSync();
   
   // Initialize Firebase with hardcoded credentials
   initFirebase();
@@ -124,7 +143,28 @@ void setup() {
 void loop() {
   // Always run display refresh first - this ensures continuous display
   Disp.loop(); 
-  ScrollingText(0, 50); // Always keep the display scrolling
+  
+  // Handle clock/text switching based on scroll completion
+  if (!showClock) {
+    // Show scrolling text and check if it completed
+    bool completed = ScrollingText(0, 90);
+    if (completed && !scrollCompleted) {
+      // Scroll just completed, switch to clock
+      scrollCompleted = true;
+      showClock = true;
+      lastClockSwitch = millis();
+      Disp.clear();
+    }
+  } else {
+    // Show clock and check if 6 seconds passed
+    if (millis() - lastClockSwitch >= clockDisplayTime) {
+      showClock = false;
+      scrollCompleted = false;
+      Disp.clear();
+    } else {
+      displayDigitalClock();
+    }
+  }
 
   // Check WiFi connection periodically
   if (millis() - lastWiFiCheck > wifiCheckInterval) {
@@ -159,17 +199,21 @@ void loop() {
 //--------------------------
 // DISPLAY SCROLLING TEXT
 
-void ScrollingText(int y, uint8_t speed) {
+bool ScrollingText(int y, uint8_t speed) {
 
   static uint32_t pM;
   static uint32_t x;
   static String lastDisplayText = "";
   static bool needsRedraw = true;
   
-  uint32_t width = Disp.width();
-  uint32_t height = Disp.height();
-  Disp.setFont(ElektronMart6x8);
-  uint32_t fullScroll = Disp.textWidth(displayText.c_str()) + width;
+  uint32_t width = Disp.width();  // 32 pixels wide
+  uint32_t height = Disp.height(); // 16 pixels high
+  Disp.setFont(ElektronMart6x12);
+  uint32_t textWidth = Disp.textWidth(displayText.c_str());
+  
+  // Start from center and scroll to the left, then wrap around to right side
+  uint32_t centerStart = width / 2; // Start from center (pixel 16)
+  uint32_t fullScroll = textWidth + width; // Total scroll distance
   
   // Check if text has changed
   if (displayText != lastDisplayText) {
@@ -178,12 +222,15 @@ void ScrollingText(int y, uint8_t speed) {
     x = 0; // Reset scroll position when text changes
   }
   
+  bool scrollComplete = false;
+  
   if((millis() - pM) > speed) { 
     pM = millis();
     if (x < fullScroll) {
       ++x;
     } else {
       x = 0;
+      scrollComplete = true; // One complete scroll cycle finished
     }
     needsRedraw = true;
   }
@@ -191,10 +238,23 @@ void ScrollingText(int y, uint8_t speed) {
   // Only clear and redraw when necessary
   if (needsRedraw) {
     Disp.clear();
-    // Center the text vertically in the full display
-    Disp.drawText(width - x, (height / 2) - 4, displayText.c_str());
+    
+    // Calculate text position: start from center, move left
+    int32_t textX = centerStart - x;
+    
+    // If text has moved completely off the left side, wrap it to the right side
+    if (textX + textWidth < 0) {
+      textX = width + (textX + textWidth);
+    }
+    
+    // Center the text vertically in the display
+    int textY = (height / 2) - 6; // Adjust for font height
+    
+    Disp.drawText(textX, textY, displayText.c_str());
     needsRedraw = false;
   }
+  
+  return scrollComplete;
 }
 
 //--------------------------
@@ -629,4 +689,93 @@ void updateTextFromFirebase() {
     dataChanged = true;
     Serial.println("Firebase update completed. Total sentences: " + String(totalSentences));
   }
+}
+
+//--------------------------
+// TIME SYNCHRONIZATION
+
+void initTimeSync() {
+  displayMessage("Syncing time...");
+  
+  // Configure time with NTP servers
+  configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org", "time.nist.gov");
+  
+  // Wait for time to be set
+  int attempts = 0;
+  while (!time(nullptr) && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (time(nullptr)) {
+    displayMessage("Time synced!");
+    Serial.println("\nTime synchronized successfully");
+  } else {
+    displayMessage("Time sync failed");
+    Serial.println("\nFailed to sync time");
+  }
+  
+  delay(1000);
+}
+
+//--------------------------
+// DIGITAL CLOCK DISPLAY
+
+void displayDigitalClock() {
+  // Handle colon blinking
+  if (millis() - lastColonBlink >= colonBlinkInterval) {
+    colonBlink = !colonBlink;
+    lastColonBlink = millis();
+  }
+  
+  // Get current time
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+  
+  if (!timeinfo) {
+    Disp.clear();
+    Disp.setFont(ElektronMart6x12);
+    Disp.drawText(2, 4, "TIME ERROR");
+    return;
+  }
+  
+  // Convert to 12-hour format
+  int hour = timeinfo->tm_hour;
+  int minute = timeinfo->tm_min;
+  
+  // Convert 24-hour to 12-hour format
+  if (hour == 0) {
+    hour = 12; // Midnight
+  } else if (hour > 12) {
+    hour = hour - 12; // Afternoon/Evening
+  }
+  
+  // Format time components separately for fixed positioning
+  String hourStr = (hour < 10) ? " " + String(hour) : String(hour);
+  String minStr = (minute < 10) ? "0" + String(minute) : String(minute);
+  
+  // Clear display
+  Disp.clear();
+  Disp.setFont(ElektronMart6x12);
+  
+  // Calculate fixed positions for each component
+  int hourWidth = Disp.textWidth(hourStr.c_str());
+  int colonWidth = Disp.textWidth(":");
+  int minWidth = Disp.textWidth(minStr.c_str());
+  
+  // Total width for centering
+  int totalWidth = hourWidth + colonWidth + minWidth;
+  int startX = (32 - totalWidth) / 2;
+  int startY = (16 - 12) / 2;
+  
+  // Draw components at fixed positions
+  Disp.drawText(startX, startY, hourStr.c_str());
+  
+  // Only draw colon when it should be visible
+  if (colonBlink) {
+    Disp.drawText(startX + hourWidth, startY, ":");
+  }
+  
+  Disp.drawText(startX + hourWidth + colonWidth, startY, minStr.c_str());
 }
